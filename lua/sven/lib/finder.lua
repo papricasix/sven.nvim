@@ -1,0 +1,483 @@
+local config = require("sven.config")
+local a = require("sven.lib.async")
+
+local function refocus_status_buffer()
+  local status = require("sven.buffers.status")
+  if status.instance() then
+    status.instance():focus()
+    status.instance():dispatch_refresh(nil, "finder.refocus")
+  end
+end
+
+local copy_selection = function()
+  local selection = require("telescope.actions.state").get_selected_entry()
+  if selection ~= nil then
+    vim.cmd.let(("@+=%q"):format(selection[1]))
+  end
+end
+
+local function telescope_mappings(on_select, allow_multi, refocus_status)
+  local action_state = require("telescope.actions.state")
+  local actions = require("telescope.actions")
+
+  local function close_action(prompt_bufnr)
+    actions.close(prompt_bufnr)
+
+    if refocus_status then
+      refocus_status_buffer()
+    end
+  end
+
+  --- Lift the picker select action to a item select action
+  local function select_action(prompt_bufnr)
+    local selection = {}
+
+    local picker = action_state.get_current_picker(prompt_bufnr)
+    if #picker:get_multi_selection() > 0 then
+      for _, item in ipairs(picker:get_multi_selection()) do
+        table.insert(selection, item[1])
+      end
+    elseif action_state.get_selected_entry() ~= nil then
+      local entry = action_state.get_selected_entry()[1]
+      local prompt = picker:_get_prompt()
+
+      local navigate_up_level = entry == ".." and #prompt > 0
+      local input_git_refspec = prompt:match("%^")
+        or prompt:match("~")
+        or prompt:match("@")
+        or prompt:match(":")
+
+      if navigate_up_level or input_git_refspec then
+        table.insert(selection, prompt)
+      else
+        table.insert(selection, entry)
+      end
+    else
+      table.insert(selection, picker:_get_prompt())
+    end
+
+    if not selection[1] or selection[1] == "" then
+      return
+    end
+
+    close_action(prompt_bufnr)
+
+    if allow_multi then
+      on_select(selection)
+    else
+      on_select(selection[1])
+    end
+  end
+
+  local function close(...)
+    -- Make sure to notify the caller that we aborted to avoid hanging on the async task forever
+    on_select(nil)
+    close_action(...)
+  end
+
+  local function completion_action(prompt_bufnr)
+    local picker = action_state.get_current_picker(prompt_bufnr)
+    -- selene: allow(empty_if)
+    if #picker:get_multi_selection() > 0 then
+      -- Don't autocomplete with multiple selection
+    elseif action_state.get_selected_entry() ~= nil then
+      picker:set_prompt(action_state.get_selected_entry()[1])
+    end
+  end
+
+  return function(_, map)
+    local commands = {
+      ["Select"] = select_action,
+      ["Close"] = close,
+      ["InsertCompletion"] = completion_action,
+      ["Next"] = actions.move_selection_next,
+      ["Previous"] = actions.move_selection_previous,
+      ["CopySelection"] = copy_selection,
+      ["NOP"] = actions.nop,
+      ["MultiselectToggleNext"] = actions.toggle_selection + actions.move_selection_worse,
+      ["MultiselectTogglePrevious"] = actions.toggle_selection + actions.move_selection_better,
+      ["MultiselectToggle"] = actions.toggle_selection,
+    }
+
+    -- Telescope HEAD has mouse click support, but not the latest tag. Need to check if the user has
+    -- support for mouse click, while avoiding the error that the metatable raises.
+    -- stylua: ignore
+    if pcall(function() return actions.mouse_click and true end) then
+      commands.ScrollWheelDown = actions.move_selection_next
+      commands.ScrollWheelUp = actions.move_selection_previous
+      commands.MouseClick = actions.mouse_click
+    end
+
+    for mapping, command in pairs(config.values.mappings.finder) do
+      if command and command:match("^Multiselect") then
+        if allow_multi then
+          map({ "i" }, mapping, commands[command])
+        end
+      elseif command then
+        map({ "i" }, mapping, commands[command])
+      end
+    end
+
+    return false
+  end
+end
+
+--- Build the fzf-lua actions table and an abort handler
+---
+--- The `esc`/`ctrl-c`/`ctrl-q` actions only fire when fzf is given one of those
+--- keys and prints it back; if the fzf process is instead terminated (window
+--- closed, job killed) no action is dispatched at all. The caller wires the
+--- returned `on_close` to `winopts.on_close` so an abort still completes the
+--- finder via `nil`, matching the abort semantics of every other integration.
+---@param on_select fun(item: any|nil)
+---@param allow_multi boolean
+---@param refocus_status boolean
+---@return table actions
+---@return function on_close
+local function fzf_actions(on_select, allow_multi, refocus_status)
+  local completed = false
+
+  local function refresh()
+    if refocus_status then
+      refocus_status_buffer()
+    end
+  end
+
+  local function complete(selection)
+    if completed then
+      return
+    end
+    completed = true
+    on_select(selection)
+    refresh()
+  end
+
+  local function close_action()
+    complete(nil)
+  end
+
+  return {
+    ["default"] = function(selected)
+      complete(allow_multi and selected or selected[1])
+    end,
+    ["esc"] = close_action,
+    ["ctrl-c"] = close_action,
+    ["ctrl-q"] = close_action,
+  },
+    close_action
+end
+
+---Convert entries to snack picker items
+---@param entries any[]
+---@return any[]
+local function entries_to_snack_items(entries)
+  local items = {}
+  for idx, entry in ipairs(entries) do
+    table.insert(items, { idx = idx, score = 0, text = entry })
+  end
+  return items
+end
+
+--- Utility function to map actions
+---@param on_select fun(item: any|nil)
+---@param allow_multi boolean
+---@param refocus_status boolean
+local function snacks_confirm(on_select, allow_multi, refocus_status)
+  local completed = false
+  local function complete(selection)
+    if completed then
+      return
+    end
+    on_select(selection)
+    completed = true
+    if refocus_status then
+      refocus_status_buffer()
+    end
+  end
+  local function confirm(picker, item)
+    local selection = {}
+    local picker_selected = picker:selected { fallback = true }
+
+    if #picker_selected == 0 then
+      local prompt = picker:filter().pattern
+      table.insert(selection, prompt)
+    elseif #picker_selected > 1 then
+      for _, item in ipairs(picker_selected) do
+        table.insert(selection, item.text)
+      end
+    else
+      local entry = item.text
+      local prompt = picker:filter().pattern
+
+      local navigate_up_level = entry == ".." and #prompt > 0
+      local input_git_refspec = prompt:match("%^")
+        or prompt:match("~")
+        or prompt:match("@")
+        or prompt:match(":")
+
+      table.insert(selection, (navigate_up_level or input_git_refspec) and prompt or entry)
+    end
+
+    if selection and selection[1] and selection[1] ~= "" then
+      complete(allow_multi and selection or selection[1])
+      picker:close()
+    end
+  end
+
+  local function on_close()
+    complete(nil)
+  end
+
+  return confirm, on_close
+end
+
+--- Build `source.choose` and an abort handler for mini.pick
+---
+--- Unlike the confirm path, `source.choose` is not invoked when the picker is
+--- aborted (e.g. <Esc>); the caller wires the returned `on_stop` to a
+--- `MiniPickStop` autocmd so an abort still completes the finder via `nil`,
+--- matching the abort semantics of every other integration.
+---@param on_select fun(item: any|nil)
+---@param refocus_status boolean
+---@return function choose, function on_stop
+local function mini_pick_choose(on_select, refocus_status)
+  local completed = false
+  local function complete(selection)
+    if completed then
+      return
+    end
+    on_select(selection)
+    completed = true
+    if refocus_status then
+      refocus_status_buffer()
+    end
+  end
+
+  local function choose(item)
+    complete(item)
+  end
+
+  local function on_stop()
+    complete(nil)
+  end
+
+  return choose, on_stop
+end
+
+--- Utility function to map finder opts to fzf
+---@param opts FinderOpts
+---@return table
+local function fzf_opts(opts)
+  local fzf_opts = {}
+
+  -- Allow multi by default
+  if opts.allow_multi then
+    fzf_opts["--multi"] = ""
+  else
+    fzf_opts["--no-multi"] = ""
+  end
+
+  if opts.layout_config.prompt_position ~= "top" then
+    fzf_opts["--layout"] = "reverse-list"
+  end
+
+  if opts.border then
+    fzf_opts["--border"] = "rounded"
+  else
+    fzf_opts["--border"] = "none"
+  end
+
+  return fzf_opts
+end
+
+---@return FinderOpts
+local function default_opts()
+  return {
+    layout_config = {
+      height = 0.3,
+      prompt_position = "top",
+      preview_cutoff = vim.fn.winwidth(0),
+    },
+    refocus_status = true,
+    allow_multi = false,
+    border = false,
+    prompt_prefix = "select",
+    previewer = false,
+    cache_picker = false,
+    layout_strategy = "bottom_pane",
+    sorting_strategy = "ascending",
+    theme = "ivy",
+  }
+end
+
+---@class FinderOpts
+---@field layout_config table
+---@field allow_multi boolean
+---@field border boolean
+---@field prompt_prefix string
+---@field previewer boolean
+---@field layout_strategy string
+---@field sorting_strategy string
+---@field theme string
+
+---@class Finder
+---@field opts table
+---@field entries table
+---@field mappings function|nil
+local Finder = {}
+Finder.__index = Finder
+
+---@param opts FinderOpts
+---@return Finder
+function Finder:new(opts)
+  local this = {
+    opts = vim.tbl_deep_extend("keep", opts, default_opts()),
+    entries = {},
+    select_action = nil,
+  }
+
+  setmetatable(this, self)
+
+  return this
+end
+
+---Adds entries to internal table
+---@param entries table
+---@return Finder
+function Finder:add_entries(entries)
+  for _, entry in ipairs(entries) do
+    table.insert(self.entries, entry)
+  end
+  return self
+end
+
+---Engages finder and invokes `on_select` with the item or items, or nil if aborted
+---@param on_select fun(item: any|nil)
+function Finder:find(on_select)
+  if config.check_integration("telescope") then
+    local pickers = require("telescope.pickers")
+    local finders = require("telescope.finders")
+    local sorters = require("telescope.sorters")
+
+    self.opts.prompt_prefix = string.format(" %s > ", self.opts.prompt_prefix)
+
+    local default_sorter
+    local native_sorter = function()
+      local fzf_extension = require("telescope").extensions.fzf
+      if fzf_extension then
+        default_sorter = fzf_extension.native_fzf_sorter()
+      end
+    end
+
+    if not pcall(native_sorter) then
+      default_sorter = sorters.get_generic_fuzzy_sorter()
+    end
+
+    pickers
+      .new(self.opts, {
+        finder = finders.new_table { results = self.entries },
+        sorter = config.values.telescope_sorter() or default_sorter,
+        attach_mappings = telescope_mappings(on_select, self.opts.allow_multi, self.opts.refocus_status),
+      })
+      :find()
+  elseif config.check_integration("fzf_lua") then
+    local fzf_lua = require("fzf-lua")
+    local actions, on_close = fzf_actions(on_select, self.opts.allow_multi, self.opts.refocus_status)
+    fzf_lua.fzf_exec(self.entries, {
+      prompt = string.format("%s> ", self.opts.prompt_prefix),
+      fzf_opts = fzf_opts(self.opts),
+      winopts = {
+        height = self.opts.layout_config.height,
+        border = self.opts.border,
+        preview = { border = self.opts.border },
+        -- fzf-lua invokes `winopts.on_close` from `FzfWin:close()` before the
+        -- selected action is dispatched, so defer the abort completion to the
+        -- next event loop tick; the `completed` guard turns the resulting
+        -- double call into a no-op when a selection was already dispatched.
+        on_close = function()
+          vim.schedule(on_close)
+        end,
+      },
+      actions = actions,
+    })
+  elseif config.check_integration("mini_pick") then
+    local mini_pick = require("mini.pick")
+    local choose, on_stop = mini_pick_choose(on_select, self.opts.refocus_status)
+    -- `source.choose` only fires on explicit confirm (<CR>); aborting via <Esc> goes
+    -- through `picker_stop` and never calls `choose`. Without the `MiniPickStop`
+    -- handler below, `on_select` would never run on abort, leaving the `find_async`
+    -- coroutine suspended forever (the picker then appears dead until restart).
+    local group = vim.api.nvim_create_augroup("SvenMiniPickStop", { clear = true })
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "MiniPickStop",
+      once = true,
+      group = group,
+      callback = function()
+        vim.api.nvim_clear_autocmds { group = group }
+        on_stop()
+      end,
+    })
+    mini_pick.start { source = { items = self.entries, choose = choose } }
+  elseif config.check_integration("snacks") then
+    local snacks_picker = require("snacks.picker")
+    local confirm, on_close = snacks_confirm(on_select, self.opts.allow_multi, self.opts.refocus_status)
+    snacks_picker.pick(nil, {
+      title = "Sven",
+      prompt = string.format("%s > ", self.opts.prompt_prefix),
+      items = entries_to_snack_items(self.entries),
+      format = "text",
+      layout = {
+        preset = self.opts.theme,
+        preview = self.opts.previewer,
+        height = self.opts.layout_config.height,
+        border = self.opts.border and "rounded" or "none",
+      },
+      confirm = confirm,
+      on_close = on_close,
+    })
+  else
+    vim.ui.select(self.entries, {
+      prompt = string.format("%s: ", self.opts.prompt_prefix),
+      format_item = function(entry)
+        return entry
+      end,
+    }, function(item)
+      vim.schedule(function()
+        on_select(self.opts.allow_multi and { item } or item)
+
+        if self.opts.refocus_status then
+          refocus_status_buffer()
+        end
+      end)
+    end)
+  end
+end
+
+---@type async fun(self: Finder): any|nil
+--- Asynchronously prompt the user for the selection, and return the selected item or nil if aborted.
+Finder.find_async = a.wrap(Finder.find, 2)
+
+---Builds Finder instance
+---@param opts table|nil
+---@return Finder
+function Finder.create(opts)
+  return Finder:new(opts or {})
+end
+
+--- Example usage
+function Finder.test()
+  a.run(function()
+    local f = Finder:create()
+    f:add_entries { "a", "b", "c" }
+
+    local item = f:find_async()
+
+    if item then
+      print("Got item: ", vim.inspect(item))
+    else
+      print("Aborted")
+    end
+  end)
+end
+
+return Finder
