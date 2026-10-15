@@ -385,7 +385,10 @@ describe("buffers.status", function()
 
       t.feed("<tab>")
       assert.are.same(line, vim.fn.foldclosed(line))
-      assert.are.same(line + 3, vim.fn.foldclosedend(line))
+      assert.are.same(line + 2, vim.fn.foldclosedend(line))
+      -- The empty line below stays visible and keeps the folded section apart from the next one
+      assert.are.same(-1, vim.fn.foldclosed(line + 3))
+      assert.are.same("", t.lines()[line + 3])
 
       t.feed("<tab>")
       assert.are.same(-1, vim.fn.foldclosed(line))

@@ -1143,7 +1143,7 @@ M.n_go_to_next_hunk_header = function(self)
         next_location = last + 1
       end
 
-      if next_location < section_last then
+      if next_location <= section_last then
         self.buffer:move_cursor(next_location)
       end
 
@@ -1517,13 +1517,23 @@ M.n_command = function(self)
   end)
 end
 
+---The section under the cursor. The empty line below a section counts as part of it.
+---@param self StatusBuffer
+---@return Component|nil
+local function section_at_cursor(self)
+  local line = fn.line(".")
+  return self.buffer.ui:get_current_section(line)
+    or (line > 1 and self.buffer.ui:get_current_section(line - 1) or nil)
+end
+
 ---@param self StatusBuffer
 ---@return fun(): nil
 M.n_next_section = function(self)
   return function()
-    local section = self.buffer.ui:get_current_section()
+    local section = section_at_cursor(self)
     if section then
-      local position = section.position.row_end + 2
+      -- Past the empty line and the title of the next section, onto its first item
+      local position = section.position.row_end + 3
       self.buffer:move_cursor(position)
     else
       local first = self.buffer.ui:first_section().first
@@ -1538,9 +1548,10 @@ end
 ---@return fun(): nil
 M.n_prev_section = function(self)
   return function()
-    local section = self.buffer.ui:get_current_section()
+    local section = section_at_cursor(self)
     if section then
-      local prev_section = self.buffer.ui:get_current_section(section.position.row_start - 1)
+      -- Above the title is the empty line, above that the end of the previous section
+      local prev_section = self.buffer.ui:get_current_section(section.position.row_start - 2)
       if prev_section then
         self.buffer:move_cursor(prev_section.position.row_start + 1)
         return

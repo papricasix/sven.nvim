@@ -114,16 +114,20 @@ local Section = Component.new(function(props)
     count = { text(" ("), text.highlight("SvenSectionHeaderCount")(#props.items), text(")") }
   end
 
-  return col.tag("Section")({
-    row(util.merge(props.title, count or {})),
-    col(map(props.items, props.render)),
+  -- The blank line sits outside the fold, so it still separates the section from the next one
+  -- when the section is folded.
+  return col {
+    col.tag("Section")({
+      row(util.merge(props.title, count or {})),
+      col(map(props.items, props.render)),
+    }, {
+      foldable = true,
+      folded = props.folded,
+      section = props.name,
+      id = props.name,
+    }),
     EmptyLine(),
-  }, {
-    foldable = true,
-    folded = props.folded,
-    section = props.name,
-    id = props.name,
-  })
+  }
 end)
 
 ---What sets an item apart, beyond its mode: shown in parentheses behind its name.
